@@ -22,15 +22,24 @@ namespace FixWhitespace
             if (parsedArgs.Count != 1)
             {
                 Log($"Args: '{string.Join("', '", parsedArgs)}'");
-                Log("Usage: FixWhitespace [-dryrun] [-t tabsize] [-x excludefile...] <filepattern>");
+                Log("Usage: FixWhitespace [-dryrun] [-t tabsize] [-x excludefile...] <path/pattern>");
                 return 1;
             }
 
-            string pattern = parsedArgs[0];
+            string path, pattern;
 
-            Log($"Using pattern: '{pattern}'");
+            if (parsedArgs[0].Contains(Path.DirectorySeparatorChar) || parsedArgs[0].Contains(Path.AltDirectorySeparatorChar))
+            {
+                path = Path.GetDirectoryName(parsedArgs[0]);
+                pattern = Path.GetFileName(parsedArgs[0]);
+            }
+            else
+            {
+                path = ".";
+                pattern = parsedArgs[0];
+            }
 
-            string[] files = Directory.GetFiles(".", pattern, SearchOption.AllDirectories)
+            string[] files = Directory.GetFiles(path, pattern, SearchOption.AllDirectories)
                 .Select(f => (f.StartsWith($".{Path.DirectorySeparatorChar}") || f.StartsWith($".{Path.AltDirectorySeparatorChar}")) ? f.Substring(2) : f)
                 .ToArray();
 
@@ -42,91 +51,98 @@ namespace FixWhitespace
 
             foreach (string filename in files)
             {
-                Log($"Reading: '{filename}'");
-                byte[] buf = File.ReadAllBytes(filename);
+                FixFile(filename, tabSize, dryrun);
+            }
 
-                if (buf.Length == 0)
+            return 0;
+        }
+
+        static void FixFile(string filename, int tabSize, bool dryrun)
+        {
+            Log($"Reading: '{filename}'");
+            byte[] buf = File.ReadAllBytes(filename);
+
+            if (buf.Length == 0)
+            {
+                return;
+            }
+
+            var newcontent = new List<byte>(buf.Length);
+
+            bool modified = false;
+
+            int startOfLine = 0;
+
+            for (int i = 0; i < buf.Length; i++)
+            {
+                if (buf[i] == '\r' || buf[i] == '\n' || i == buf.Length - 1)
                 {
-                    continue;
-                }
-
-                bool hasBom = buf[0] == 239 || buf[0] == 254 || buf[0] == 255;
-                bool addRowAtEnd = buf[buf.Length - 1] == '\r' || buf[buf.Length - 1] == '\n';
-
-                string[] rows = File.ReadAllLines(filename);
-
-                bool modified = false;
-
-                for (int row = 0; row < rows.Length; row++)
-                {
-                    if (rows[row] == string.Empty)
+                    if (i == startOfLine)
                     {
+                        newcontent.Add(buf[i]);
+                        startOfLine = i + 1;
                         continue;
                     }
 
-                    if (rows[row].All(c => c == ' ' || c == '\t'))
+                    byte[] row = (i == buf.Length - 1) ?
+                        buf.Skip(startOfLine).Take(i - startOfLine + 1).ToArray() :
+                        buf.Skip(startOfLine).Take(i - startOfLine).ToArray();
+
+                    if (row.All(c => c == ' ' || c == '\t'))
                     {
-                        rows[row] = string.Empty;
+                        if (i != buf.Length - 1)
+                        {
+                            newcontent.Add(buf[i]);
+                        }
+                        startOfLine = i + 1;
                         modified = true;
                         continue;
                     }
 
-                    if (rows[row].EndsWith(' ') || rows[row].EndsWith('\t'))
-                    {
-                        rows[row] = rows[row].TrimEnd();
-                        modified = true;
-                    }
-
-                    int indentation = GetIndentation(rows[row], tabSize, out bool hadTabs);
+                    int indentation = GetIndentation(row, tabSize, out bool hadTabs, out int bytesOffset);
                     //Log($"Indentation: {indentation}");
-                    if (hadTabs || indentation % tabSize != 0)
+
+                    int trailing = GetTrailing(row);
+                    //Log($"Trailing: {trailing}");
+
+                    if (hadTabs || indentation % tabSize != 0 || trailing > 0)
                     {
                         int spaces = indentation % tabSize;
+                        int newindentation = indentation;
                         if (spaces > tabSize / 2)
                         {
                             //Log($"Spaces1: {spaces}");
-                            indentation += tabSize - spaces;
+                            newindentation += tabSize - spaces;
                         }
                         else
                         {
                             //Log($"Spaces2: {spaces}");
-                            indentation -= spaces;
+                            newindentation -= spaces;
                         }
 
-                        //Log($"New indentation: {indentation}");
+                        //Log($"New indentation: {newindentation}");
 
-                        rows[row] = new string(' ', indentation) + rows[row].Trim();
+                        newcontent.AddRange(Enumerable.Repeat((byte)' ', newindentation));
+                        newcontent.AddRange(row.Skip(bytesOffset).Take(row.Length - bytesOffset - trailing));
+
+                        startOfLine = i + 1;
                         modified = true;
-                    }
-                }
-
-                if (modified)
-                {
-                    if (addRowAtEnd)
-                    {
-                        Array.Resize(ref rows, rows.Length + 1);
-                        rows[rows.Length - 1] = string.Empty;
+                        continue;
                     }
 
-                    Log($"Saving: '{filename}'");
-                    if (hasBom)
-                    {
-                        if (!dryrun)
-                        {
-                            File.WriteAllLines(filename, rows, Encoding.UTF8);
-                        }
-                    }
-                    else
-                    {
-                        if (!dryrun)
-                        {
-                            File.WriteAllLines(filename, rows);
-                        }
-                    }
+                    newcontent.AddRange(row);
+                    startOfLine = i + 1;
                 }
             }
 
-            return 0;
+            if (modified)
+            {
+                Log($"Saving: '{filename}'");
+                if (!dryrun)
+                {
+                    File.WriteAllBytes(filename, newcontent.ToArray());
+                }
+            }
         }
 
         static bool ExtractBoolFlag(List<string> args, string flag)
@@ -194,9 +210,10 @@ namespace FixWhitespace
             return returnFiles.ToArray();
         }
 
-        static int GetIndentation(string row, int tabSize, out bool hadTabs)
+        static int GetIndentation(byte[] row, int tabSize, out bool hadTabs, out int bytesOffset)
         {
             int indentation = 0;
+            bytesOffset = 0;
 
             hadTabs = false;
 
@@ -220,9 +237,22 @@ namespace FixWhitespace
                         indentation += tabSize - overflow;
                     }
                 }
+                bytesOffset++;
             }
 
             return indentation;
+        }
+
+        static int GetTrailing(byte[] row)
+        {
+            int trailing = 0;
+
+            for (int i = row.Length; i > 0 && (row[i - 1] == ' ' || row[i - 1] == '\t'); i--)
+            {
+                trailing++;
+            }
+
+            return trailing;
         }
 
         static void Log(string message)
